@@ -4,6 +4,8 @@ const db = require('./db');
 const config = require('./config');
 const tr = require('tor-request');
 
+const AVAILABLE_VACCINES = ['COVISHIELD', 'COVAXIN', 'SPUTNIK V'];
+
 function getCalendar() {
   const today = getTodayDate();
   const url = `https://cdn-api.co-vin.in/api/v2/appointment/sessions/public/calendarByPin?pincode=${config.pincode}&date=${today}`;
@@ -12,20 +14,18 @@ function getCalendar() {
     return request.get(url);
   } else {
     return new Promise((resolve, reject) => {
-      // cowin api is geo fenced so we use tor
       tr.request(url, function (err, res, body) {
-        if (!err && res.statusCode == 200) {
-          try {
-            body = JSON.parse(body);
-
-            resolve(body);
-          } catch {
-            reject(new Error(`failed to parse body ${body} as JSON`));
-          }
-        } else {
-          reject(err);
+        if (err || !res || res.statusCode !== 200) {
+          reject(err || new Error(`Request failed with status ${res ? res.statusCode : 'unknown'}`));
+          return;
         }
-      })
+        try {
+          body = JSON.parse(body);
+          resolve(body);
+        } catch (parseErr) {
+          reject(new Error(`Failed to parse body ${body} as JSON`));
+        }
+      });
     });
   }
 }
@@ -34,28 +34,36 @@ function isSessionAvailable(session) {
   const minAgeFilters = config.minAge || [18, 45];
   const vaccineFilters = config.vaccines || AVAILABLE_VACCINES;
 
-  const isAgeMatching = minAgeFilters.filter(minAgeFilter => minAgeFilter >= session.min_age_limit).length > 0;
-  const isVaccineMatching = vaccineFilters.filter(vaccineFilter => vaccineFilter.toUpperCase() === session.vaccine).length > 0;
+  const isAgeMatching = minAgeFilters.some(minAgeFilter => session.min_age_limit >= minAgeFilter);
+  const isVaccineMatching = vaccineFilters.some(vaccineFilter => vaccineFilter.toUpperCase() === session.vaccine);
   const hasSlots = session.available_capacity > 0;
-  // in dev we want to ignore the db content for testing
-  const isSessionNotified = db.find(session);
+  const isSessionNotified = db.find({ session_id: session.session_id });
 
   return isAgeMatching && isVaccineMatching && hasSlots && !isSessionNotified;
 }
 
 async function getAvailableSessions() {
-  const calendar = await getCalendar();
-  const sessions = [];
+  try {
+    const calendar = await getCalendar();
+    const sessions = [];
 
-  for (const center of calendar.centers) {
-    for (const session of center.sessions) {
-      if (isSessionAvailable(session)) {
-        sessions.push({ ...session, address: `${center.address}, ${center.district_name}, ${center.state_name}`, name: center.name });
+    for (const center of calendar.centers) {
+      for (const session of center.sessions) {
+        if (isSessionAvailable(session)) {
+          sessions.push({
+            ...session,
+            address: `${center.address}, ${center.district_name}, ${center.state_name}`,
+            name: center.name,
+          });
+        }
       }
     }
-  }
 
-  return sessions;
+    return sessions;
+  } catch (error) {
+    console.error('Error fetching available sessions:', error);
+    throw error;
+  }
 }
 
 module.exports = { getAvailableSessions };
